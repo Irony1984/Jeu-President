@@ -1,136 +1,118 @@
 /* ============================================================
-   gamestate.js — L'état central du jeu (GameState)
+   managers/calendar.js — Le CalendarManager
    ------------------------------------------------------------
-   Un unique objet contient TOUTES les données du jeu.
-   C'est le "contrat" que tous les Managers respectent :
-   chaque Manager lit et écrit ici, et rien d'autre.
-   C'est aussi cet objet, et lui seul, qui est sauvegardé.
-   Réf : Chapitre 13 — Architecture technique.
+   Gère le temps du jeu : une file d'événements datés, et
+   l'avancement du temps selon DEUX régimes (ch. 4 & 13) :
+     - hors mercato  : saut direct au prochain événement
+     - en mercato    : jour par jour, pour ne rater aucune offre
+
+   Un Manager ne s'appelle jamais lui-même un autre Manager :
+   il agit sur le GameState, et c'est le Game Engine qui orchestre.
    ============================================================ */
 
-const GameState = {
+const CalendarManager = (function () {
 
-  /* --- Métadonnées de la partie --- */
-  meta: {
-    version: 1,            // version du schéma (pour migrations futures)
-    createdAt: null,       // date de création de la partie (timestamp)
-    lastSaved: null,       // date de dernière sauvegarde (timestamp)
-    seed: null,            // graine aléatoire (pour reproductibilité)
-  },
+  /* --- Utilitaires de date (chaînes AAAA-MM-JJ) --- */
 
-  /* --- Le temps --- */
-  time: {
-    currentDate: null,     // date courante dans le jeu (AAAA-MM-JJ)
-    season: 1,             // numéro de saison en cours
-    inMercato: false,      // sommes-nous dans une fenêtre de mercato ?
-    phase: "season",       // "season" | "intersaison"
-  },
+  function toDate(str) {
+    const [y, m, d] = str.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  }
 
-  /* --- Le Président (le joueur) --- */
-  president: {
-    name: "",
-    reputation: "amateur", // "amateur" | "confirme" | "legende"
-    personalWealth: 0,     // fortune personnelle (M), distincte du club
-  },
+  function toStr(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
 
-  /* --- Le club du joueur --- */
-  club: {
-    id: null,
-    name: "",
-    country: null,         // pays choisi parmi les 5 grands
-    division: 2,           // on démarre en 2e division
-    cash: 0,               // trésorerie du club (M)
-    reputation: 0,         // réputation du club (0-100)
-    stadiumCapacity: 0,
-    academyLevel: 1,       // niveau du centre de formation
-    medicalLevel: 1,       // niveau du centre médical
-  },
+  function addDays(str, n) {
+    const dt = toDate(str);
+    dt.setDate(dt.getDate() + n);
+    return toStr(dt);
+  }
 
-  /* --- Le Board --- */
-  board: {
-    confidence: 70,        // confiance sur 100 (départ : 70)
-    objectives: [],        // 3 objectifs de la saison en cours
-  },
+  function compare(a, b) {
+    // -1 si a<b, 0 si égal, 1 si a>b (comparaison de chaînes triables)
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
 
-  /* --- Le climat interne (jauges) --- */
-  climate: {
-    coachTrust: 70,        // confiance du coach (0-100)
-    dressingRoom: 70,      // ambiance du vestiaire (0-100)
-  },
+  /* --- Gestion de la file d'événements --- */
 
-  /* --- Les entités du monde --- */
-  players: [],             // tous les joueurs (tous clubs confondus)
-  clubs: [],               // tous les clubs (IA + joueur)
-  staff: [],               // coach, scouts, médical
+  /* Ajoute un événement daté et garde la file triée par date. */
+  function addEvent(gs, event) {
+    // event = { date, type, payload?, id? }
+    gs.events.push(event);
+    gs.events.sort((a, b) => compare(a.date, b.date));
+  }
 
-  /* --- Le monde / compétitions --- */
-  world: {
-    competitions: [],      // championnats, coupes, europe
-    standings: {},         // classements par compétition
-  },
+  /* Renvoie le prochain événement à traiter (le plus proche
+     dans le futur ou aujourd'hui), sans le retirer. */
+  function peekNextEvent(gs) {
+    const today = gs.time.currentDate;
+    for (const ev of gs.events) {
+      if (compare(ev.date, today) >= 0) return ev;
+    }
+    return null;
+  }
 
-  /* --- La file d'événements (moteur du temps) --- */
-  events: [],              // événements datés, triés par date
+  /* Retire un événement précis de la file (une fois traité). */
+  function removeEvent(gs, event) {
+    const i = gs.events.indexOf(event);
+    if (i !== -1) gs.events.splice(i, 1);
+  }
 
-  /* --- Historique (Hall of Fame, palmarès...) --- */
-  history: {
-    hallOfFame: [],
-    seasons: [],
-  },
-};
+  /* --- Avancement du temps : les deux régimes --- */
 
-/* ------------------------------------------------------------
-   Fabrique d'une nouvelle partie vierge.
-   Retourne un GameState frais (copie profonde du modèle),
-   initialisé avec les quelques valeurs de départ nécessaires.
-   ------------------------------------------------------------ */
-function createNewGame(options = {}) {
-  // Copie profonde du modèle pour ne jamais muter l'original.
-  const gs = structuredClone(GameState);
+  /* Détermine si une date tombe dans une fenêtre de mercato.
+     Mercato d'été : juillet-août. Mercato d'hiver : janvier.
+     (Valeurs simples de départ, ajustables plus tard.) */
+  function isMercato(dateStr) {
+    const month = Number(dateStr.split("-")[1]);
+    return month === 7 || month === 8 || month === 1;
+  }
 
-  const now = Date.now();
-  gs.meta.createdAt = now;
-  gs.meta.lastSaved = now;
-  gs.meta.seed = options.seed ?? now;
+  /* Avance le temps d'UN cran et renvoie ce qu'il s'est passé.
+     - En mercato : +1 jour (on s'arrête sur chaque jour pour
+       ne manquer aucune offre).
+     - Hors mercato : saut direct à la date du prochain événement.
+     Renvoie { newDate, reachedEvent | null }. */
+  function advance(gs) {
+    const today = gs.time.currentDate;
+    const next = peekNextEvent(gs);
 
-  // Le temps démarre à une date de pré-saison (1er juillet).
-  // L'année est arbitraire ; seule la mécanique compte.
-  gs.time.currentDate = options.startDate ?? "2025-07-01";
-  gs.time.season = 1;
-  gs.time.inMercato = false;
-  gs.time.phase = "season";
+    // Régime mercato : avancer d'un seul jour.
+    if (gs.time.inMercato) {
+      const newDate = addDays(today, 1);
+      gs.time.currentDate = newDate;
+      gs.time.inMercato = isMercato(newDate);
+      // L'événement n'est "atteint" que si sa date == aujourd'hui.
+      const reached = (next && compare(next.date, newDate) === 0) ? next : null;
+      return { newDate, reachedEvent: reached };
+    }
 
-  // Le Président.
-  gs.president.name = options.presidentName ?? "Président";
-  gs.president.reputation = options.reputation ?? "amateur";
-  gs.president.personalWealth = 0;
+    // Régime hors mercato : sauter directement au prochain événement.
+    if (next) {
+      gs.time.currentDate = next.date;
+      gs.time.inMercato = isMercato(next.date);
+      return { newDate: next.date, reachedEvent: next };
+    }
 
-  // Le club (valeurs d'équilibrage de départ, ch. 17).
-  gs.club.name = options.clubName ?? "Club Sans Nom";
-  gs.club.country = options.country ?? null;
-  gs.club.division = 2;
-  gs.club.cash = 15;          // 15 M de trésorerie de départ en D2
-  gs.club.reputation = 20;
-  gs.club.academyLevel = 1;
-  gs.club.medicalLevel = 1;
+    // Aucun événement en file : avancer d'un jour par défaut.
+    const newDate = addDays(today, 1);
+    gs.time.currentDate = newDate;
+    gs.time.inMercato = isMercato(newDate);
+    return { newDate, reachedEvent: null };
+  }
 
-  // Le Board démarre à 70 de confiance.
-  gs.board.confidence = 70;
-  gs.board.objectives = [];
+  return {
+    // dates
+    toDate, toStr, addDays, compare,
+    // file d'événements
+    addEvent, peekNextEvent, removeEvent,
+    // temps
+    isMercato, advance,
+  };
+})();
 
-  // État financier (journal des opérations, compteurs de saison).
-  gs.finance = { ledger: [], seasonIncome: 0, seasonExpense: 0 };
-  gs.world.tvPaidSeason = false;
-
-  // État des transferts (offres du mercato en cours).
-  gs.transfers = { offers: [], loans: [], active: [], window: false };
-
-  // Staff : tous les postes vacants au départ (intérimaires par défaut).
-  gs.staff = { coach: null, scout: null, medic: null };
-
-  return gs;
-}
-
-/* Rendre accessible globalement (chargement par <script>, sans modules). */
-window.GameState = GameState;
-window.createNewGame = createNewGame;
+window.CalendarManager = CalendarManager;

@@ -1,118 +1,143 @@
 /* ============================================================
-   managers/calendar.js — Le CalendarManager
+   managers/finance.js — Le FinanceManager (Phase 2)
    ------------------------------------------------------------
-   Gère le temps du jeu : une file d'événements datés, et
-   l'avancement du temps selon DEUX régimes (ch. 4 & 13) :
-     - hors mercato  : saut direct au prochain événement
-     - en mercato    : jour par jour, pour ne rater aucune offre
+   Gère l'argent du club : revenus (billetterie au match, droits
+   TV en début de saison) et dépenses (salaires annuels des
+   joueurs, prélevés en fin de saison). Réf : Chapitre 10.
 
-   Un Manager ne s'appelle jamais lui-même un autre Manager :
-   il agit sur le GameState, et c'est le Game Engine qui orchestre.
+   Toutes les opérations passent par gs.club.cash et sont
+   journalisées dans gs.finance.ledger (pour l'écran Finances).
    ============================================================ */
 
-const CalendarManager = (function () {
+const FinanceManager = (function () {
 
-  /* --- Utilitaires de date (chaînes AAAA-MM-JJ) --- */
-
-  function toDate(str) {
-    const [y, m, d] = str.split("-").map(Number);
-    return new Date(y, m - 1, d);
+  /* Salaire ANNUEL d'un joueur selon son niveau (en M).
+     Courbe croissante : ~0,05 M à niveau 50, ~0,5 M à niveau 85.
+     On utilise une progression douce puis plus raide vers le haut. */
+  function playerSalary(level) {
+    // Base quadratique normalisée : (level/100)^3 * facteur.
+    const s = Math.pow(level / 100, 3) * 0.85;
+    // Arrondi à 0,01 M près, minimum 0,02 M.
+    return Math.max(0.02, Math.round(s * 100) / 100);
   }
 
-  function toStr(date) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, "0");
-    const d = String(date.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
+  /* Masse salariale annuelle du club du joueur (somme des salaires). */
+  function annualWageBill(gs) {
+    const squad = gs.players.filter(p => p.clubId === gs.club.id);
+    const total = squad.reduce((sum, p) => sum + playerSalary(p.level), 0);
+    return Math.round(total * 100) / 100;
   }
 
-  function addDays(str, n) {
-    const dt = toDate(str);
-    dt.setDate(dt.getDate() + n);
-    return toStr(dt);
-  }
-
-  function compare(a, b) {
-    // -1 si a<b, 0 si égal, 1 si a>b (comparaison de chaînes triables)
-    return a < b ? -1 : a > b ? 1 : 0;
-  }
-
-  /* --- Gestion de la file d'événements --- */
-
-  /* Ajoute un événement daté et garde la file triée par date. */
-  function addEvent(gs, event) {
-    // event = { date, type, payload?, id? }
-    gs.events.push(event);
-    gs.events.sort((a, b) => compare(a.date, b.date));
-  }
-
-  /* Renvoie le prochain événement à traiter (le plus proche
-     dans le futur ou aujourd'hui), sans le retirer. */
-  function peekNextEvent(gs) {
-    const today = gs.time.currentDate;
-    for (const ev of gs.events) {
-      if (compare(ev.date, today) >= 0) return ev;
+  /* Initialise l'état financier (appelé à la création de partie). */
+  function init(gs) {
+    if (!gs.finance) {
+      gs.finance = { ledger: [], seasonIncome: 0, seasonExpense: 0 };
     }
-    return null;
   }
 
-  /* Retire un événement précis de la file (une fois traité). */
-  function removeEvent(gs, event) {
-    const i = gs.events.indexOf(event);
-    if (i !== -1) gs.events.splice(i, 1);
+  /* Enregistre une opération dans le journal financier + applique
+     au cash. amount > 0 = revenu, amount < 0 = dépense. */
+  function record(gs, date, label, amount) {
+    init(gs);
+    gs.club.cash = Math.round((gs.club.cash + amount) * 100) / 100;
+    gs.finance.ledger.push({ date, label, amount });
+    if (amount >= 0) gs.finance.seasonIncome = Math.round((gs.finance.seasonIncome + amount) * 100) / 100;
+    else gs.finance.seasonExpense = Math.round((gs.finance.seasonExpense - amount) * 100) / 100;
+    // Limiter la taille du journal (on garde les 100 dernières lignes).
+    if (gs.finance.ledger.length > 100) gs.finance.ledger.shift();
   }
 
-  /* --- Avancement du temps : les deux régimes --- */
-
-  /* Détermine si une date tombe dans une fenêtre de mercato.
-     Mercato d'été : juillet-août. Mercato d'hiver : janvier.
-     (Valeurs simples de départ, ajustables plus tard.) */
-  function isMercato(dateStr) {
-    const month = Number(dateStr.split("-")[1]);
-    return month === 7 || month === 8 || month === 1;
+  /* Droits TV versés en début de saison (bloc). Montant fixe D2. */
+  function payTvRights(gs, date) {
+    const amount = 4; // 4 M forfaitaires en 2e division
+    record(gs, date, "Droits TV (saison)", amount);
+    return amount;
   }
 
-  /* Avance le temps d'UN cran et renvoie ce qu'il s'est passé.
-     - En mercato : +1 jour (on s'arrête sur chaque jour pour
-       ne manquer aucune offre).
-     - Hors mercato : saut direct à la date du prochain événement.
-     Renvoie { newDate, reachedEvent | null }. */
-  function advance(gs) {
-    const today = gs.time.currentDate;
-    const next = peekNextEvent(gs);
+  /* Recette de billetterie pour un match à domicile. Modulée par la
+     force de l'adversaire (une grosse affiche remplit le stade). */
+  function gateReceipts(gs, date, opponentId) {
+    const opp = gs.clubs.find(c => c.id === opponentId);
+    const oppStrength = opp ? opp.strength : 55;
+    // Base 0,25 M + bonus selon l'adversaire (0 à ~0,25 M).
+    const bonus = Math.max(0, (oppStrength - 50)) * 0.012;
+    const amount = Math.round((0.25 + bonus) * 100) / 100;
+    record(gs, date, `Billetterie vs ${opp ? opp.name : "?"}`, amount);
+    return amount;
+  }
 
-    // Régime mercato : avancer d'un seul jour.
-    if (gs.time.inMercato) {
-      const newDate = addDays(today, 1);
-      gs.time.currentDate = newDate;
-      gs.time.inMercato = isMercato(newDate);
-      // L'événement n'est "atteint" que si sa date == aujourd'hui.
-      const reached = (next && compare(next.date, newDate) === 0) ? next : null;
-      return { newDate, reachedEvent: reached };
+  /* Prélève la masse salariale annuelle (fin de saison, avant Board).
+     Ajustée pour les prêts entrants (on ne paie que la part négociée). */
+  function payAnnualWages(gs, date) {
+    let bill = annualWageBill(gs);
+    if (window.TransferManager && TransferManager.loanWageAdjustment) {
+      bill = Math.round((bill + TransferManager.loanWageAdjustment(gs)) * 100) / 100;
     }
+    bill = Math.max(0, bill);
+    record(gs, date, "Salaires annuels des joueurs", -bill);
 
-    // Régime hors mercato : sauter directement au prochain événement.
-    if (next) {
-      gs.time.currentDate = next.date;
-      gs.time.inMercato = isMercato(next.date);
-      return { newDate: next.date, reachedEvent: next };
+    // Salaires du staff (Phase 3), prélevés également en fin de saison.
+    if (window.StaffManager) {
+      const staffBill = StaffManager.annualStaffWages(gs);
+      if (staffBill > 0) {
+        record(gs, date, "Salaires du staff", -staffBill);
+      }
+      return Math.round((bill + staffBill) * 100) / 100;
     }
+    return bill;
+  }
 
-    // Aucun événement en file : avancer d'un jour par défaut.
-    const newDate = addDays(today, 1);
-    gs.time.currentDate = newDate;
-    gs.time.inMercato = isMercato(newDate);
-    return { newDate, reachedEvent: null };
+  /* Réinitialise les compteurs de saison (revenus/dépenses). */
+  function resetSeasonCounters(gs) {
+    init(gs);
+    gs.finance.seasonIncome = 0;
+    gs.finance.seasonExpense = 0;
+  }
+
+  /* Projette la trésorerie de fin de saison à partir de l'état actuel.
+     Détaille : trésorerie actuelle, billetterie restante estimée, droits
+     TV encore à venir, salaires annuels à payer, et le solde projeté.
+     Réf : aide à la décision du président (objectif financier). */
+  function projectSeasonEnd(gs) {
+    init(gs);
+    const cash = gs.club.cash;
+
+    // Matchs à domicile encore à jouer (billetterie à venir estimée).
+    const cal = WorldManager.getPlayerCalendar(gs);
+    const homeLeft = cal.filter(m => m.isHome && !m.played);
+    let gateLeft = 0;
+    for (const m of homeLeft) {
+      // Réutiliser la même formule que gateReceipts (sans enregistrer).
+      const opp = gs.clubs.find(c => c.name === m.opponent);
+      const oppStrength = opp ? opp.strength : 55;
+      const bonus = Math.max(0, (oppStrength - 50)) * 0.012;
+      gateLeft += 0.25 + bonus;
+    }
+    gateLeft = Math.round(gateLeft * 100) / 100;
+
+    // Droits TV encore à venir ? (0 s'ils sont déjà versés cette saison)
+    const tvLeft = gs.world.tvPaidSeason ? 0 : 4;
+
+    // Salaires annuels à payer en fin de saison.
+    const wages = annualWageBill(gs);
+
+    const projected = Math.round((cash + gateLeft + tvLeft - wages) * 100) / 100;
+
+    return {
+      cash,
+      gateLeft,
+      homeMatchesLeft: homeLeft.length,
+      tvLeft,
+      wages,
+      projected,
+    };
   }
 
   return {
-    // dates
-    toDate, toStr, addDays, compare,
-    // file d'événements
-    addEvent, peekNextEvent, removeEvent,
-    // temps
-    isMercato, advance,
+    init, playerSalary, annualWageBill,
+    record, payTvRights, gateReceipts, payAnnualWages,
+    resetSeasonCounters, projectSeasonEnd,
   };
 })();
 
-window.CalendarManager = CalendarManager;
+window.FinanceManager = FinanceManager;

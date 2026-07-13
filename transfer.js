@@ -1,235 +1,147 @@
 /* ============================================================
-   managers/world.js — Le WorldManager (Phase 1)
+   managers/match.js — Le MatchManager (Phase 1)
    ------------------------------------------------------------
-   Construit le championnat de 2e division : clubs, effectifs,
-   calendrier (round-robin aller-retour), classement. Simule
-   les matchs des clubs IA journée par journée (ch. 6).
+   Résout le match du club du joueur. Produit un RÉSULTAT et un
+   FIL D'ÉVÉNEMENTS commenté (ch. 12). L'écran de match pourra
+   dérouler le fil OU sauter au résultat via "Simuler" — dans
+   les deux cas, le résultat final est le même (déjà calculé).
+   Le Président observe : aucune action pendant le match (R001).
    ============================================================ */
 
-const WorldManager = (function () {
+const MatchManager = (function () {
 
-  /* Construit le monde de Phase 1 à partir d'une liste de clubs.
-     Remplit gs.clubs, gs.players, le calendrier et le classement.
-     playerClubInfo : { name, city } — le club du joueur, qui est
-     AJOUTÉ au championnat (nouvelle entité, pas un club existant).
-     Sa force est générée automatiquement (modeste, D2 réaliste).
-     Retourne l'id du club du joueur. */
-  function setupLeague(gs, clubList, playerClubInfo) {
-    gs.clubs = [];
-    gs.players = [];
+  /* Résout le match du joueur.
+     home/away = ids de club. Retourne :
+       { homeId, awayId, homeName, awayName,
+         homeGoals, awayGoals, feed: [ {minute, text}, ... ] } */
+  function resolvePlayerMatch(gs, homeId, awayId) {
+    const r = WorldManager.simulateMatch(gs, homeId, awayId);
+    const homeName = clubName(gs, homeId);
+    const awayName = clubName(gs, awayId);
 
-    // 1. Créer les clubs existants + leurs effectifs.
-    clubList.forEach((c, idx) => {
-      const clubId = idx + 1;
-      gs.clubs.push({
-        id: clubId,
-        name: c.name,
-        city: c.city || "",
-        strength: c.strength,
-        isPlayer: false,
-      });
-      const squad = PlayerManager.generateSquad(clubId, c.strength);
-      gs.players.push(...squad);
-    });
+    const feed = buildFeed(gs, homeId, awayId, r.homeGoals, r.awayGoals, homeName, awayName);
 
-    // 2. AJOUTER le club du joueur au championnat (nouvelle entité).
-    //    Force modeste générée automatiquement : un nouveau venu en D2.
-    const playerId = gs.clubs.length + 1;
-    const playerStrength = 50 + Math.floor(Math.random() * 7); // 50-56
-    const playerClub = {
-      id: playerId,
-      name: playerClubInfo.name,
-      city: playerClubInfo.city || "",
-      strength: playerStrength,
-      isPlayer: true,
+    // Appliquer le résultat au classement (comme pour les clubs IA).
+    WorldManager.applyResult(gs, homeId, awayId, r.homeGoals, r.awayGoals);
+
+    // Enregistrer le résultat du match du joueur (pour le calendrier).
+    if (!gs.world.playerResults) gs.world.playerResults = {};
+    gs.world.playerResults[gs.world.currentMatchday] = {
+      matchday: gs.world.currentMatchday,
+      homeId, awayId, homeName, awayName,
+      homeGoals: r.homeGoals, awayGoals: r.awayGoals,
     };
-    gs.clubs.push(playerClub);
-    gs.players.push(...PlayerManager.generateSquad(playerId, playerStrength));
 
-    gs.club.id = playerId;
-    gs.club.name = playerClub.name;
-    gs.club.city = playerClub.city;
-
-    // 3. Générer le calendrier (round-robin aller-retour).
-    gs.world.competitions = [{
-      id: "d2",
-      name: "2e Division",
-      type: "league",
-      clubIds: gs.clubs.map(c => c.id),
-    }];
-    gs.world.fixtures = buildFixtures(gs.clubs.map(c => c.id));
-    gs.world.currentMatchday = 0;
-
-    // 4. Initialiser le classement.
-    gs.world.standings = {};
-    for (const c of gs.clubs) {
-      gs.world.standings[c.id] = {
-        clubId: c.id, played: 0, won: 0, drawn: 0, lost: 0,
-        gf: 0, ga: 0, points: 0,
-      };
-    }
-
-    return playerClub.id;
-  }
-
-  /* Algorithme du "cercle" (round-robin) : génère les journées
-     aller, puis retour (matchs inversés). Renvoie un tableau de
-     journées, chaque journée = tableau de {home, away}. */
-  function buildFixtures(clubIds) {
-    const ids = clubIds.slice();
-    if (ids.length % 2 !== 0) ids.push(null); // bye si impair
-    const n = ids.length;
-    const rounds = n - 1;
-    const half = n / 2;
-    const days = [];
-
-    let arr = ids.slice();
-    for (let r = 0; r < rounds; r++) {
-      const day = [];
-      for (let i = 0; i < half; i++) {
-        const home = arr[i];
-        const away = arr[n - 1 - i];
-        if (home !== null && away !== null) {
-          // alterner domicile/extérieur pour l'équité
-          if (r % 2 === 0) day.push({ home, away });
-          else day.push({ home: away, away: home });
-        }
-      }
-      days.push(day);
-      // rotation (on fixe le 1er élément)
-      const fixed = arr[0];
-      const rest = arr.slice(1);
-      rest.unshift(rest.pop());
-      arr = [fixed, ...rest];
-    }
-
-    // Matchs retour = aller inversés.
-    const returnDays = days.map(day =>
-      day.map(m => ({ home: m.away, away: m.home }))
-    );
-    return days.concat(returnDays);
-  }
-
-  /* Simule un match entre deux clubs à partir de leur force.
-     Renvoie { homeGoals, awayGoals }. Modèle simple : la force
-     relative augmente le nombre de buts espérés, avec de l'aléa. */
-  function simulateMatch(gs, homeId, awayId) {
-    const rh = PlayerManager.teamRating(gs, homeId) + 4; // avantage domicile
-    const ra = PlayerManager.teamRating(gs, awayId);
-    const diff = rh - ra;
-    // buts espérés : base 1.3, modulée par l'écart de niveau
-    const lambdaH = Math.max(0.2, 1.3 + diff * 0.04);
-    const lambdaA = Math.max(0.2, 1.3 - diff * 0.04);
-    return {
-      homeGoals: poisson(lambdaH),
-      awayGoals: poisson(lambdaA),
-    };
-  }
-
-  /* Tirage de Poisson (nombre de buts) — algorithme de Knuth. */
-  function poisson(lambda) {
-    const L = Math.exp(-lambda);
-    let k = 0, p = 1;
-    do { k++; p *= Math.random(); } while (p > L);
-    return k - 1;
-  }
-
-  /* Applique un résultat au classement. */
-  function applyResult(gs, homeId, awayId, hg, ag) {
-    const S = gs.world.standings;
-    const h = S[homeId], a = S[awayId];
-    h.played++; a.played++;
-    h.gf += hg; h.ga += ag;
-    a.gf += ag; a.ga += hg;
-    if (hg > ag) { h.won++; h.points += 3; a.lost++; }
-    else if (hg < ag) { a.won++; a.points += 3; h.lost++; }
-    else { h.drawn++; a.drawn++; h.points++; a.points++; }
-  }
-
-  /* Simule TOUTE une journée SAUF le match du club du joueur
-     (celui-ci est joué via le MatchManager / écran de match).
-     Renvoie la liste des résultats + le match du joueur éventuel. */
-  function playMatchday(gs, matchdayIndex) {
-    const fixtures = gs.world.fixtures[matchdayIndex];
-    if (!fixtures) return { results: [], playerMatch: null };
-
-    const results = [];
-    let playerMatch = null;
-
-    for (const m of fixtures) {
-      const involvesPlayer = (m.home === gs.club.id || m.away === gs.club.id);
-      if (involvesPlayer) {
-        playerMatch = m; // sera résolu par l'écran de match
-        continue;
-      }
-      const r = simulateMatch(gs, m.home, m.away);
-      applyResult(gs, m.home, m.away, r.homeGoals, r.awayGoals);
-      results.push({ ...m, ...r });
-    }
-    return { results, playerMatch };
-  }
-
-  /* Construit le calendrier du joueur : pour chaque journée, la date,
-     l'adversaire, domicile/extérieur, et le résultat si déjà joué.
-     S'appuie sur les événements "matchday" (datés) et les fixtures. */
-  function getPlayerCalendar(gs) {
-    const out = [];
+    // Attribuer les statistiques individuelles aux joueurs du club.
     const myId = gs.club.id;
-    // Dates des journées : table permanente (remplie à la programmation),
-    // avec repli sur les événements encore en file.
-    const dateByMatchday = Object.assign({}, gs.world.matchdayDates || {});
-    for (const ev of gs.events) {
-      if (ev.type === "matchday" && !dateByMatchday[ev.matchday]) {
-        dateByMatchday[ev.matchday] = ev.date;
+    const isHome = homeId === myId;
+    const goalsFor = isHome ? r.homeGoals : r.awayGoals;
+    const goalsAgainst = isHome ? r.awayGoals : r.homeGoals;
+    recordPlayerStats(gs, myId, goalsFor, goalsAgainst);
+
+    return {
+      homeId, awayId, homeName, awayName,
+      homeGoals: r.homeGoals, awayGoals: r.awayGoals,
+      feed,
+    };
+  }
+
+  /* Répartit les statistiques d'un match sur les joueurs du club :
+     matchs joués (le onze), buts et passes décisives pondérés par poste
+     et niveau, cartons au hasard, clean sheet au gardien si 0 encaissé. */
+  function recordPlayerStats(gs, clubId, goalsFor, goalsAgainst) {
+    const squad = gs.players.filter(p => p.clubId === clubId);
+    if (squad.length === 0) return;
+    // Le onze : 11 meilleurs par niveau.
+    const eleven = squad.slice().sort((a, b) => b.level - a.level).slice(0, 11);
+    for (const p of eleven) {
+      p.stats = p.stats || { apps: 0, goals: 0, assists: 0, cards: 0, cleansheets: 0 };
+      p.stats.apps += 1;
+    }
+    // Poids offensif par poste (les attaquants marquent le plus).
+    const posteWeight = { A: 6, M: 3, D: 1, G: 0.05 };
+    const weightOf = (p) => (posteWeight[p.poste] || 1) * (0.5 + p.level / 100);
+
+    const pickWeighted = () => {
+      const total = eleven.reduce((s, p) => s + weightOf(p), 0);
+      let x = Math.random() * total;
+      for (const p of eleven) { x -= weightOf(p); if (x <= 0) return p; }
+      return eleven[0];
+    };
+
+    // Buts marqués -> buteur + éventuelle passe décisive (autre joueur).
+    for (let i = 0; i < goalsFor; i++) {
+      const scorer = pickWeighted();
+      scorer.stats.goals += 1;
+      if (Math.random() < 0.7) {
+        let passer = pickWeighted();
+        let tries = 0;
+        while (passer === scorer && tries < 5) { passer = pickWeighted(); tries++; }
+        if (passer !== scorer) passer.stats.assists += 1;
       }
     }
-    const results = gs.world.playerResults || {};
 
-    for (let md = 0; md < gs.world.fixtures.length; md++) {
-      const day = gs.world.fixtures[md];
-      const m = day.find(x => x.home === myId || x.away === myId);
-      if (!m) continue; // journée de repos (nombre impair de clubs)
-
-      const isHome = m.home === myId;
-      const oppId = isHome ? m.away : m.home;
-      const opp = gs.clubs.find(c => c.id === oppId);
-      const res = results[md] || null;
-
-      out.push({
-        matchday: md,
-        date: dateByMatchday[md] || null,
-        opponent: opp ? opp.name : "?",
-        isHome: isHome,
-        played: !!res,
-        result: res,
-      });
+    // Clean sheet : si aucun but encaissé, le gardien (et la défense) en profite.
+    if (goalsAgainst === 0) {
+      const gk = eleven.find(p => p.poste === "G");
+      if (gk) gk.stats.cleansheets += 1;
     }
-    return out;
+
+    // Cartons : 0 à 2 par match, répartis au hasard dans le onze.
+    const nbCards = Math.random() < 0.5 ? 0 : (Math.random() < 0.8 ? 1 : 2);
+    for (let i = 0; i < nbCards; i++) {
+      const p = eleven[Math.floor(Math.random() * eleven.length)];
+      p.stats.cards += 1;
+    }
   }
 
-  /* Renvoie le prochain match du joueur (non encore joué). */
-  function getNextPlayerMatch(gs) {
-    const cal = getPlayerCalendar(gs);
-    return cal.find(m => !m.played) || null;
-  }
-  function getStandings(gs) {
-    const rows = Object.values(gs.world.standings);
-    rows.sort((x, y) =>
-      y.points - x.points ||
-      (y.gf - y.ga) - (x.gf - x.ga) ||
-      y.gf - x.gf
-    );
-    return rows.map((row, i) => {
-      const club = gs.clubs.find(c => c.id === row.clubId);
-      return { rank: i + 1, name: club.name, isPlayer: club.isPlayer, ...row };
-    });
+  /* Construit un fil d'événements plausible cohérent avec le score.
+     On place les buts à des minutes aléatoires, triées, plus le
+     coup d'envoi / mi-temps / coup de sifflet final. */
+  function buildFeed(gs, homeId, awayId, hg, ag, homeName, awayName) {
+    const goals = [];
+    for (let i = 0; i < hg; i++) goals.push({ side: "home", minute: rndMinute() });
+    for (let i = 0; i < ag; i++) goals.push({ side: "away", minute: rndMinute() });
+    goals.sort((a, b) => a.minute - b.minute);
+
+    const feed = [];
+    feed.push({ minute: 0, text: `Coup d'envoi : ${homeName} — ${awayName}` });
+
+    let h = 0, a = 0, halftimeInserted = false;
+    for (const g of goals) {
+      if (!halftimeInserted && g.minute > 45) {
+        feed.push({ minute: 45, text: `Mi-temps : ${homeName} ${h} - ${a} ${awayName}` });
+        halftimeInserted = true;
+      }
+      if (g.side === "home") h++; else a++;
+      const scorer = randomScorer(gs, g.side === "home" ? homeId : awayId);
+      const team = g.side === "home" ? homeName : awayName;
+      feed.push({ minute: g.minute, text: `⚽ ${g.minute}' BUT pour ${team} ! (${scorer})  [${h}-${a}]` });
+    }
+    if (!halftimeInserted) {
+      feed.push({ minute: 45, text: `Mi-temps : ${homeName} ${h} - ${a} ${awayName}` });
+    }
+    feed.push({ minute: 90, text: `Coup de sifflet final : ${homeName} ${hg} - ${ag} ${awayName}` });
+    return feed;
   }
 
-  return {
-    setupLeague, buildFixtures, simulateMatch, applyResult,
-    playMatchday, getStandings, poisson,
-    getPlayerCalendar, getNextPlayerMatch,
-  };
+  function rndMinute() { return Math.floor(Math.random() * 90) + 1; }
+
+  function randomScorer(gs, clubId) {
+    // Un buteur plausible : plutôt un attaquant/milieu, sinon n'importe.
+    const squad = gs.players.filter(p => p.clubId === clubId);
+    const attackers = squad.filter(p => p.poste === "A" || p.poste === "M");
+    const pool = attackers.length ? attackers : squad;
+    if (!pool.length) return "un joueur";
+    return pool[Math.floor(Math.random() * pool.length)].name;
+  }
+
+  function clubName(gs, clubId) {
+    const c = gs.clubs.find(c => c.id === clubId);
+    return c ? c.name : "?";
+  }
+
+  return { resolvePlayerMatch };
 })();
 
-window.WorldManager = WorldManager;
+window.MatchManager = MatchManager;

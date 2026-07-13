@@ -1,236 +1,176 @@
 /* ============================================================
-   managers/staff.js — Le StaffManager (Phase 3)
+   managers/season.js — Orchestration des saisons (Phase 1)
    ------------------------------------------------------------
-   Le staff du club : entraîneur principal, recruteur, médecin.
-   Noté en étoiles (1-5). Recruté à tout moment (salaire annuel).
-   On démarre sans staff : chaque poste vacant est tenu par un
-   INTÉRIMAIRE de très bas niveau (dépannage), jusqu'au recrutement
-   d'un titulaire. Réf : ch. 9 (détaillé dans l'addendum A9).
-
-   Effets (Phase 3) :
-   - Entraîneur : bonus de forme/progression + bilan de pré-saison.
-   - Recruteur : révèle le potentiel + oriente les offres (à venir).
-   - Médecin : améliore forme/récupération (blessures plus tard).
+   Met en place une saison : championnat + calendrier des journées.
+   Gère aussi l'ENCHAÎNEMENT vers la saison suivante (nextSeason).
    ============================================================ */
 
-const StaffManager = (function () {
+const SeasonManager = (function () {
 
-  const ROLES = ["coach", "scout", "medic"];
-  const ROLE_LABEL = { coach: "Entraîneur principal", scout: "Recruteur", medic: "Médecin" };
-
-  const PRENOMS = ["Alberto", "Gianni", "Marcello", "Ottavio", "Paolo", "Sergio",
-    "Enzo", "Fabio", "Guido", "Renato", "Vittorio", "Cesare", "Aldo", "Bruno"];
-  const NOMS = ["Ancelli", "Bianco", "De Luca", "Ferraro", "Gallo", "Marino",
-    "Neri", "Palermo", "Riva", "Sacchi", "Tardelli", "Vialli", "Zoff", "Baggio"];
-
-  function _rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-  function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-  function _round(x) { return Math.round(x * 100) / 100; }
-
-  /* Salaire annuel selon les étoiles (~0,2 M pour 1★ à ~1,5 M pour 5★). */
-  function starSalary(stars) {
-    const table = { 1: 0.2, 2: 0.45, 3: 0.75, 4: 1.1, 5: 1.5 };
-    return table[stars] || 0.2;
+  /* Démarre la PREMIÈRE saison : crée la ligue (club du joueur ajouté),
+     puis entre en PRÉ-SAISON (intersaison avec stage) avant la saison 1.
+     Uniformise le déroulé : toute saison commence par une pré-saison. */
+  function startSeason(gs, clubList, playerClubInfo) {
+    WorldManager.setupLeague(gs, clubList, playerClubInfo);
+    // On entre en pré-saison au lieu de programmer les matchs tout de suite.
+    // La saison 1 sera programmée à la fin de la pré-saison (goToPreseason).
+    gs.world.firstSeasonPending = true;
+    startIntersaison(gs);
   }
 
-  /* Intérimaire d'un poste vacant : 1 étoile, quasi gratuit, effet minime. */
-  function interim(role) {
-    const base = { role, name: "Intérimaire", stars: 1, salary: 0.05, interim: true };
-    if (role === "coach") base.style = "eq"; // intérimaire : style neutre
-    return base;
-  }
-
-  /* Initialise le staff : tous les postes vacants (donc intérimaires). */
-  function init(gs) {
-    if (!gs.staff) gs.staff = { coach: null, scout: null, medic: null };
-    for (const r of ROLES) if (!gs.staff[r]) gs.staff[r] = null;
-  }
-
-  /* Renvoie le membre effectif d'un poste : le titulaire recruté, ou
-     l'intérimaire par défaut si le poste est vacant. */
-  function current(gs, role) {
-    init(gs);
-    return gs.staff[role] || interim(role);
-  }
-
-  /* Étoiles effectives d'un poste (intérimaire = 1). */
-  function stars(gs, role) { return current(gs, role).stars; }
-
-  /* Plafond d'étoiles atteignable selon la réputation du président.
-     Un club modeste n'attire pas les meilleurs profils : un 5★ refuse
-     carrément un club amateur (il n'apparaît pas). Réf : R019. */
-  function starCap(gs) {
-    const rep = (gs.president && gs.president.reputation) || "amateur";
-    if (rep === "legende") return 5;
-    if (rep === "confirme") return 4;
-    return 3; // amateur
-  }
-
-  /* Tire un nombre d'étoiles pondéré : sous le plafond, les hautes
-     étoiles sont plus rares (rareté progressive). */
-  function _drawStars(cap) {
-    // Poids décroissants vers le haut ; tronqués au plafond.
-    const baseWeights = { 1: 5, 2: 5, 3: 4, 4: 2, 5: 1 };
-    const pool = [];
-    for (let s = 1; s <= cap; s++) {
-      for (let i = 0; i < baseWeights[s]; i++) pool.push(s);
+  /* Programme la saison 1 après la pré-saison initiale (sans incrémenter
+     le numéro de saison ni vieillir les joueurs — c'est la 1re saison). */
+  function beginFirstSeason(gs) {
+    // Appliquer le bonus de forme du stage de pré-saison, s'il y en a un.
+    let bonus = gs.world.pendingFormBonus || 0;
+    if (window.StaffManager) bonus += StaffManager.formBonus(gs);
+    if (bonus > 0) {
+      for (const p of gs.players) {
+        if (p.clubId === gs.club.id) {
+          p.forme = Math.min(100, (p.forme || 50) + bonus);
+        }
+      }
     }
-    return pool[Math.floor(Math.random() * pool.length)];
+    gs.world.pendingFormBonus = 0;
+    gs.world.firstSeasonPending = false;
+    gs.time.phase = "season";
+    gs.world.tvPaidSeason = false;
+    if (window.FinanceManager) FinanceManager.resetSeasonCounters(gs);
+    if (window.BoardManager) BoardManager.resetForNewSeason(gs);
+    scheduleSeason(gs);
   }
 
-  const STYLES = ["off", "def", "eq"];
-  const STYLE_LABEL = { off: "Offensif", def: "Défensif", eq: "Équilibré" };
+  /* Démarre la saison SUIVANTE : on garde les clubs et les joueurs,
+     on vieillit les joueurs d'un an, on remet le classement à zéro
+     et on reprogramme un nouveau calendrier. */
+  function nextSeason(gs) {
+    gs.time.season += 1;
 
-  /* Génère une liste de candidats variés pour un poste, bornée par la
-     réputation du club (plafond + rareté progressive). */
-  function generateCandidates(gs, role, n) {
-    const list = [];
-    n = n || 4;
-    const cap = starCap(gs);
-    for (let i = 0; i < n; i++) {
-      const st = _drawStars(cap);
-      const cand = {
-        role,
-        name: _pick(PRENOMS) + " " + _pick(NOMS),
-        stars: st,
-        salary: _round(starSalary(st) * _rand(90, 115) / 100),
-        interim: false,
+    // Vieillir tous les joueurs d'un an (léger, Phase 1).
+    for (const p of gs.players) {
+      p.age += 1;
+      // Statistiques par saison : on repart de zéro.
+      p.stats = { apps: 0, goals: 0, assists: 0, cards: 0, cleansheets: 0 };
+    }
+
+    // Appliquer le bonus de forme du stage de préparation (s'il y en a un)
+    // aux joueurs du club du joueur, pour bien démarrer la saison.
+    let bonus = gs.world.pendingFormBonus || 0;
+    if (window.StaffManager) bonus += StaffManager.formBonus(gs);
+    if (bonus > 0) {
+      for (const p of gs.players) {
+        if (p.clubId === gs.club.id) {
+          p.forme = Math.min(100, (p.forme || 50) + bonus);
+        }
+      }
+    }
+    gs.world.pendingFormBonus = 0;
+
+    // Remettre les compteurs du classement à zéro.
+    gs.world.standings = {};
+    for (const c of gs.clubs) {
+      gs.world.standings[c.id] = {
+        clubId: c.id, played: 0, won: 0, drawn: 0, lost: 0,
+        gf: 0, ga: 0, points: 0,
       };
-      // L'entraîneur a un style de jeu.
-      if (role === "coach") cand.style = _pick(STYLES);
-      list.push(cand);
     }
-    return list.sort((a, b) => b.stars - a.stars);
+
+    // Nouveau calendrier de la saison.
+    gs.world.fixtures = WorldManager.buildFixtures(gs.clubs.map(c => c.id));
+    gs.world.currentMatchday = 0;
+
+    gs.time.phase = "season";
+    gs.world.tvPaidSeason = false;
+    if (window.FinanceManager) FinanceManager.resetSeasonCounters(gs);
+    if (window.BoardManager) BoardManager.resetForNewSeason(gs);
+    scheduleSeason(gs);
   }
 
-  /* Recrute un candidat pour son poste (remplace le titulaire éventuel).
-     Pas d'indemnité : on prend en charge son salaire (masse salariale). */
-  function hire(gs, candidate) {
-    init(gs);
-    gs.staff[candidate.role] = {
-      role: candidate.role, name: candidate.name,
-      stars: candidate.stars, salary: candidate.salary, interim: false,
-      style: candidate.style, // pour l'entraîneur
-    };
-    return gs.staff[candidate.role];
-  }
+  /* Entre en INTERSAISON (après le bilan de fin de saison).
+     Période creuse, fin mai -> mi-août, où le joueur avance semaine
+     par semaine (ou saute à la pré-saison). Sème 2-3 messages simples
+     de préparation. Ne recrée PAS encore la saison : ça se fait à la
+     pré-saison via nextSeason(). */
+  function startIntersaison(gs) {
+    gs.time.phase = "intersaison";
+    // La date courante est ~ la fin de saison (mai). On fixe la
+    // reprise à la mi-août (pré-saison) de la même année civile.
+    const year = Number(gs.time.currentDate.split("-")[0]);
+    gs.time.preseasonDate = `${year}-08-15`;
 
-  /* Licencie le titulaire d'un poste : il redevient vacant (intérimaire). */
-  function dismiss(gs, role) {
-    init(gs);
-    gs.staff[role] = null;
-  }
-
-  /* Masse salariale annuelle du staff (titulaires seulement ; les
-     intérimaires ont un coût symbolique compté aussi). */
-  function annualStaffWages(gs) {
-    init(gs);
-    let total = 0;
-    for (const r of ROLES) total += current(gs, r).salary;
-    return _round(total);
-  }
-
-  /* --- EFFETS DU STAFF (Phase 3) --- */
-
-  /* Bonus de forme apporté par l'entraîneur + le médecin au démarrage
-     de saison (s'ajoute au stage). ~ +1 par étoile au-dessus de 1. */
-  function formBonus(gs) {
-    const coach = stars(gs, "coach");
-    const medic = stars(gs, "medic");
-    return (coach - 1) * 1.2 + (medic - 1) * 0.8;
-  }
-
-  /* Le recruteur révèle-t-il le potentiel d'un joueur proposé ?
-     3★+ : potentiel estimé avec précision ; sinon fourchette floue. */
-  function scoutRevealsPotential(gs) {
-    return stars(gs, "scout") >= 3;
-  }
-
-  /* --- STYLES : bonus d'équipe & évolution ---
-     Plus il y a de joueurs partageant le style de l'entraîneur, plus
-     l'équipe reçoit un bonus global de performance (le plus simple :
-     proportionnel à la part de joueurs alignés). Peu importe le style. */
-  function teamStyleBonus(gs) {
-    const coach = current(gs, "coach");
-    const coachStyle = coach.style || "eq";
-    const squad = gs.players.filter(p => p.clubId === gs.club.id);
-    if (squad.length === 0) return 0;
-    const aligned = squad.filter(p => p.style === coachStyle).length;
-    const ratio = aligned / squad.length;
-    // Bonus jusqu'à +6 points de force si toute l'équipe est alignée.
-    return _round(ratio * 6);
-  }
-
-  /* Évolution de style en fin de saison : l'entraîneur convertit
-     progressivement des joueurs vers son style. Plus le joueur est
-     jeune et plus l'entraîneur est fort, plus la conversion est probable.
-     Renvoie la liste des joueurs convertis (pour information). */
-  function evolveStyles(gs) {
-    const coach = current(gs, "coach");
-    const coachStyle = coach.style || "eq";
-    const coachStars = coach.stars || 1;
-    const squad = gs.players.filter(p => p.clubId === gs.club.id);
-    const converted = [];
-    for (const p of squad) {
-      if (p.style === coachStyle) continue;
-      let chance = 0;
-      if (p.age <= 21) chance = 0.30;
-      else if (p.age <= 25) chance = 0.20;
-      else if (p.age <= 29) chance = 0.10;
-      else chance = 0.04;
-      chance *= (0.4 + 0.15 * coachStars);
-      if (Math.random() < chance) {
-        p.style = coachStyle;
-        converted.push(p.name);
+    // Événements de préparation, répartis sur l'intersaison.
+    // Le stage est une DÉCISION (écran de choix) ; les autres sont
+    // de simples messages informatifs.
+    const msgs = [
+      { offsetDays: 7,  text: "Ouverture du mercato d'été", type: "mercato_open" },
+      { offsetDays: 14, text: "Reprise de l'entraînement", type: "intersaison_msg" },
+      { offsetDays: 35, text: "Stage de préparation", type: "training_camp" },
+      { offsetDays: 56, text: "Matchs amicaux de pré-saison", type: "intersaison_msg" },
+    ];
+    for (const m of msgs) {
+      const d = CalendarManager.addDays(gs.time.currentDate, m.offsetDays);
+      // Ne pas dépasser la date de pré-saison.
+      if (CalendarManager.compare(d, gs.time.preseasonDate) < 0) {
+        CalendarManager.addEvent(gs, {
+          date: d, type: m.type, label: m.text,
+        });
       }
     }
-    return converted;
   }
 
-  /* --- BILAN DE PRÉ-SAISON DE L'ENTRAÎNEUR ---
-     S'appuie sur l'analyse d'effectif (TransferManager.analyzeSquad).
-     La qualité/précision du bilan dépend des étoiles de l'entraîneur. */
-  function preseasonReport(gs) {
-    const coachStars = stars(gs, "coach");
-    const analysis = TransferManager.analyzeSquad(gs, gs.club.id);
-    const clubStrength = gs.clubs.find(c => c.id === gs.club.id).strength || 55;
-    const MIN = TransferManager.MIN_PER_POSTE;
-    const posteNom = { G: "gardiens", D: "défenseurs", M: "milieux", A: "attaquants" };
+  /* Programme les événements d'une saison à partir de la date
+     courante : une journée par semaine dès le ~20 août, puis un
+     événement de fin de saison. Commun à startSeason/nextSeason. */
+  function scheduleSeason(gs) {
+    let date = firstMatchdayDate(gs.time.currentDate);
+    const nbDays = gs.world.fixtures.length;
 
-    const points = [];
-    for (const poste of ["G", "D", "M", "A"]) {
-      const info = analysis[poste];
-      if (info.count < MIN[poste]) {
-        points.push(`Effectif trop court chez les ${posteNom[poste]} (${info.count}).`);
-      } else if (info.avg < clubStrength - 3) {
-        points.push(`Le niveau des ${posteNom[poste]} est en dessous du reste de l'équipe.`);
-      }
-      // Vieillissement : signalé si entraîneur suffisamment bon.
-      if (coachStars >= 2) {
-        const vieux = info.players.filter(p => p.age >= 31).length;
-        if (vieux >= 2) points.push(`Le secteur des ${posteNom[poste]} vieillit (${vieux} joueurs de 31 ans ou plus).`);
-      }
+    // Table permanente des dates de journées (survit au retrait des
+    // événements une fois les journées jouées) — utilisée par le calendrier.
+    gs.world.matchdayDates = {};
+
+    for (let md = 0; md < nbDays; md++) {
+      gs.world.matchdayDates[md] = date;
+      CalendarManager.addEvent(gs, {
+        date: date,
+        type: "matchday",
+        matchday: md,
+        label: `Journée ${md + 1}`,
+      });
+      date = CalendarManager.addDays(date, 7);
     }
 
-    let intro;
-    if (coachStars <= 1) intro = "Bilan sommaire (entraîneur intérimaire) :";
-    else if (coachStars <= 3) intro = "Bilan de pré-saison de l'entraîneur :";
-    else intro = "Analyse détaillée de l'entraîneur :";
+    CalendarManager.addEvent(gs, {
+      date: date,
+      type: "season_end",
+      label: "Fin de saison",
+    });
+    gs.world.seasonEndDate = date;
 
-    if (points.length === 0) points.push("L'effectif est équilibré, pas de faiblesse majeure détectée.");
-    // Un bon entraîneur ajoute une recommandation de priorité.
-    if (coachStars >= 4 && points.length > 1) {
-      points.push("Priorité recommandée : traiter d'abord le secteur le plus court.");
-    }
-    return { intro, points, coachStars };
+    // Événements de mercato (le mercato d'ÉTÉ est ouvert dès la pré-saison,
+    // voir startIntersaison ; ici on programme sa fermeture + l'hiver).
+    const y = Number(firstMatchdayDate(gs.time.currentDate).split("-")[0]);
+    CalendarManager.addEvent(gs, { date: `${y}-09-01`, type: "mercato_close", label: "Fermeture du mercato d'été" });
+    CalendarManager.addEvent(gs, { date: `${y + 1}-01-01`, type: "mercato_open", label: "Ouverture du mercato d'hiver" });
+    CalendarManager.addEvent(gs, { date: `${y + 1}-02-01`, type: "mercato_close", label: "Fermeture du mercato d'hiver" });
   }
 
-  return {
-    ROLES, ROLE_LABEL, STYLES, STYLE_LABEL, starSalary, interim, init, current, stars,
-    generateCandidates, starCap, hire, dismiss, annualStaffWages,
-    formBonus, scoutRevealsPotential, preseasonReport,
-    teamStyleBonus, evolveStyles,
-  };
+  /* Première journée : ~20 août de l'année qui SUIT la date courante
+     si on est déjà en fin de saison (mai), sinon l'année courante. */
+  function firstMatchdayDate(currentDate) {
+    const [y, m] = currentDate.split("-").map(Number);
+    // Si on est après juin, la saison démarre l'année suivante.
+    const year = (m >= 6) ? y : y; // Phase 1 : garder simple, même année civile
+    // Pour l'enchaînement, on part toujours du prochain 20 août
+    // situé après la date courante.
+    let target = `${y}-08-20`;
+    if (CalendarManager.compare(target, currentDate) <= 0) {
+      target = `${y + 1}-08-20`;
+    }
+    return target;
+  }
+
+  return { startSeason, beginFirstSeason, nextSeason, startIntersaison, scheduleSeason, firstMatchdayDate };
 })();
 
-window.StaffManager = StaffManager;
+window.SeasonManager = SeasonManager;

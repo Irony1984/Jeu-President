@@ -1,147 +1,152 @@
 /* ============================================================
-   managers/match.js — Le MatchManager (Phase 1)
+   managers/board.js — Le BoardManager (Phase 2)
    ------------------------------------------------------------
-   Résout le match du club du joueur. Produit un RÉSULTAT et un
-   FIL D'ÉVÉNEMENTS commenté (ch. 12). L'écran de match pourra
-   dérouler le fil OU sauter au résultat via "Simuler" — dans
-   les deux cas, le résultat final est le même (déjà calculé).
-   Le Président observe : aucune action pendant le match (R001).
+   Le Board (conseil d'administration) fixe des objectifs en
+   début de saison, suit leur progression, et évalue le président
+   en fin de saison. La confiance monte/descend selon les
+   objectifs atteints ; sous un seuil (selon réputation), le
+   président est licencié. Réf : Chapitre 5.
+
+   En Phase 2 : objectifs SPORTIF + ATTAQUE actifs. L'objectif
+   FINANCIER est défini mais activé quand les finances existeront.
    ============================================================ */
 
-const MatchManager = (function () {
+const BoardManager = (function () {
 
-  /* Résout le match du joueur.
-     home/away = ids de club. Retourne :
-       { homeId, awayId, homeName, awayName,
-         homeGoals, awayGoals, feed: [ {minute, text}, ... ] } */
-  function resolvePlayerMatch(gs, homeId, awayId) {
-    const r = WorldManager.simulateMatch(gs, homeId, awayId);
-    const homeName = clubName(gs, homeId);
-    const awayName = clubName(gs, awayId);
+  /* Catalogue des objectifs proposables, avec 3 niveaux d'ambition.
+     Chaque niveau : un seuil à atteindre, et le gain de confiance
+     si réussi. La pénalité en cas d'échec est fixe (-10, ch. 5). */
+  const MISS_PENALTY = -10;
 
-    const feed = buildFeed(gs, homeId, awayId, r.homeGoals, r.awayGoals, homeName, awayName);
-
-    // Appliquer le résultat au classement (comme pour les clubs IA).
-    WorldManager.applyResult(gs, homeId, awayId, r.homeGoals, r.awayGoals);
-
-    // Enregistrer le résultat du match du joueur (pour le calendrier).
-    if (!gs.world.playerResults) gs.world.playerResults = {};
-    gs.world.playerResults[gs.world.currentMatchday] = {
-      matchday: gs.world.currentMatchday,
-      homeId, awayId, homeName, awayName,
-      homeGoals: r.homeGoals, awayGoals: r.awayGoals,
+  function catalogue(gs) {
+    const nbClubs = gs.clubs ? gs.clubs.length : 19;
+    return {
+      sportif: {
+        label: "Objectif sportif (classement)",
+        levels: [
+          { key: "prudent",   label: "Maintien",  desc: `Finir ${nbClubs - 3}ᵉ ou mieux`, target: nbClubs - 3, reward: 5 },
+          { key: "moyen",     label: "Milieu de tableau", desc: "Finir 10ᵉ ou mieux", target: 10, reward: 10 },
+          { key: "ambitieux", label: "Podium",    desc: "Finir 3ᵉ ou mieux", target: 3, reward: 15 },
+        ],
+      },
+      attaque: {
+        label: "Objectif offensif (buts marqués)",
+        levels: [
+          { key: "prudent",   label: "Correct",   desc: "Marquer 30 buts ou plus", target: 30, reward: 5 },
+          { key: "moyen",     label: "Bon",       desc: "Marquer 45 buts ou plus", target: 45, reward: 10 },
+          { key: "ambitieux", label: "Prolifique",desc: "Marquer 60 buts ou plus", target: 60, reward: 15 },
+        ],
+      },
+      // FINANCIER : actif depuis la Phase 2 (finances de base).
+      financier: {
+        label: "Objectif financier (trésorerie en fin de saison)",
+        levels: [
+          { key: "prudent",   label: "Équilibre", desc: "Trésorerie positive", target: 0, reward: 5 },
+          { key: "moyen",     label: "Sain",      desc: "Garder 5 M ou plus", target: 5, reward: 10 },
+          { key: "ambitieux", label: "Prospère",  desc: "Garder 10 M ou plus", target: 10, reward: 15 },
+        ],
+      },
     };
+  }
 
-    // Attribuer les statistiques individuelles aux joueurs du club.
-    const myId = gs.club.id;
-    const isHome = homeId === myId;
-    const goalsFor = isHome ? r.homeGoals : r.awayGoals;
-    const goalsAgainst = isHome ? r.awayGoals : r.homeGoals;
-    recordPlayerStats(gs, myId, goalsFor, goalsAgainst);
+  /* Liste des objectifs ACTIFS en Phase 2 (financier désactivé). */
+  function activeObjectiveKeys(gs) {
+    const cat = catalogue(gs);
+    return Object.keys(cat).filter(k => !cat[k].disabled);
+  }
+
+  /* Enregistre les choix d'ambition du président pour la saison.
+     choices = { sportif: "moyen", attaque: "prudent", ... } */
+  function setObjectives(gs, choices) {
+    const cat = catalogue(gs);
+    const objectives = [];
+    for (const key of activeObjectiveKeys(gs)) {
+      const chosen = choices[key];
+      const level = cat[key].levels.find(l => l.key === chosen) || cat[key].levels[0];
+      objectives.push({
+        key: key,
+        label: cat[key].label,
+        levelKey: level.key,
+        levelLabel: level.label,
+        desc: level.desc,
+        target: level.target,
+        reward: level.reward,
+        met: null, // évalué en fin de saison
+      });
+    }
+    gs.board.objectives = objectives;
+    gs.board.objectivesSet = true;
+  }
+
+  /* Valeur courante d'un objectif (pour le suivi en cours de saison). */
+  function currentValue(gs, key) {
+    if (key === "sportif") {
+      const rows = WorldManager.getStandings(gs);
+      const me = rows.find(r => r.isPlayer);
+      return me ? me.rank : null;
+    }
+    if (key === "attaque") {
+      const s = gs.world.standings[gs.club.id];
+      return s ? s.gf : 0;
+    }
+    if (key === "financier") {
+      return gs.club.cash;
+    }
+    return null;
+  }
+
+  /* Un objectif est-il rempli, vu sa valeur courante ?
+     Sportif : rang <= cible (plus petit = mieux).
+     Attaque / financier : valeur >= cible. */
+  function isMet(key, value, target) {
+    if (value === null || value === undefined) return false;
+    if (key === "sportif") return value <= target;
+    return value >= target;
+  }
+
+  /* Évalue tous les objectifs en fin de saison, ajuste la confiance,
+     et détermine si le président est licencié. Retourne un rapport. */
+  function evaluate(gs) {
+    let delta = 0;
+    const results = [];
+    for (const obj of gs.board.objectives) {
+      const val = currentValue(gs, obj.key);
+      const met = isMet(obj.key, val, obj.target);
+      obj.met = met;
+      const change = met ? obj.reward : MISS_PENALTY;
+      delta += change;
+      results.push({
+        key: obj.key, label: obj.label, levelLabel: obj.levelLabel,
+        desc: obj.desc, value: val, target: obj.target, met, change,
+      });
+    }
+
+    gs.board.confidence = Math.max(0, Math.min(100, gs.board.confidence + delta));
+
+    // Seuil de licenciement selon la réputation (ch. 5 & 17).
+    const thresholds = { amateur: 20, confirme: 30, legende: 40 };
+    const threshold = thresholds[gs.president.reputation] ?? 20;
+    const fired = gs.board.confidence < threshold;
 
     return {
-      homeId, awayId, homeName, awayName,
-      homeGoals: r.homeGoals, awayGoals: r.awayGoals,
-      feed,
+      results,
+      delta,
+      confidence: gs.board.confidence,
+      threshold,
+      fired,
     };
   }
 
-  /* Répartit les statistiques d'un match sur les joueurs du club :
-     matchs joués (le onze), buts et passes décisives pondérés par poste
-     et niveau, cartons au hasard, clean sheet au gardien si 0 encaissé. */
-  function recordPlayerStats(gs, clubId, goalsFor, goalsAgainst) {
-    const squad = gs.players.filter(p => p.clubId === clubId);
-    if (squad.length === 0) return;
-    // Le onze : 11 meilleurs par niveau.
-    const eleven = squad.slice().sort((a, b) => b.level - a.level).slice(0, 11);
-    for (const p of eleven) {
-      p.stats = p.stats || { apps: 0, goals: 0, assists: 0, cards: 0, cleansheets: 0 };
-      p.stats.apps += 1;
-    }
-    // Poids offensif par poste (les attaquants marquent le plus).
-    const posteWeight = { A: 6, M: 3, D: 1, G: 0.05 };
-    const weightOf = (p) => (posteWeight[p.poste] || 1) * (0.5 + p.level / 100);
-
-    const pickWeighted = () => {
-      const total = eleven.reduce((s, p) => s + weightOf(p), 0);
-      let x = Math.random() * total;
-      for (const p of eleven) { x -= weightOf(p); if (x <= 0) return p; }
-      return eleven[0];
-    };
-
-    // Buts marqués -> buteur + éventuelle passe décisive (autre joueur).
-    for (let i = 0; i < goalsFor; i++) {
-      const scorer = pickWeighted();
-      scorer.stats.goals += 1;
-      if (Math.random() < 0.7) {
-        let passer = pickWeighted();
-        let tries = 0;
-        while (passer === scorer && tries < 5) { passer = pickWeighted(); tries++; }
-        if (passer !== scorer) passer.stats.assists += 1;
-      }
-    }
-
-    // Clean sheet : si aucun but encaissé, le gardien (et la défense) en profite.
-    if (goalsAgainst === 0) {
-      const gk = eleven.find(p => p.poste === "G");
-      if (gk) gk.stats.cleansheets += 1;
-    }
-
-    // Cartons : 0 à 2 par match, répartis au hasard dans le onze.
-    const nbCards = Math.random() < 0.5 ? 0 : (Math.random() < 0.8 ? 1 : 2);
-    for (let i = 0; i < nbCards; i++) {
-      const p = eleven[Math.floor(Math.random() * eleven.length)];
-      p.stats.cards += 1;
-    }
+  /* Réinitialise le drapeau d'objectifs pour la nouvelle saison. */
+  function resetForNewSeason(gs) {
+    gs.board.objectivesSet = false;
+    gs.board.objectives = [];
   }
 
-  /* Construit un fil d'événements plausible cohérent avec le score.
-     On place les buts à des minutes aléatoires, triées, plus le
-     coup d'envoi / mi-temps / coup de sifflet final. */
-  function buildFeed(gs, homeId, awayId, hg, ag, homeName, awayName) {
-    const goals = [];
-    for (let i = 0; i < hg; i++) goals.push({ side: "home", minute: rndMinute() });
-    for (let i = 0; i < ag; i++) goals.push({ side: "away", minute: rndMinute() });
-    goals.sort((a, b) => a.minute - b.minute);
-
-    const feed = [];
-    feed.push({ minute: 0, text: `Coup d'envoi : ${homeName} — ${awayName}` });
-
-    let h = 0, a = 0, halftimeInserted = false;
-    for (const g of goals) {
-      if (!halftimeInserted && g.minute > 45) {
-        feed.push({ minute: 45, text: `Mi-temps : ${homeName} ${h} - ${a} ${awayName}` });
-        halftimeInserted = true;
-      }
-      if (g.side === "home") h++; else a++;
-      const scorer = randomScorer(gs, g.side === "home" ? homeId : awayId);
-      const team = g.side === "home" ? homeName : awayName;
-      feed.push({ minute: g.minute, text: `⚽ ${g.minute}' BUT pour ${team} ! (${scorer})  [${h}-${a}]` });
-    }
-    if (!halftimeInserted) {
-      feed.push({ minute: 45, text: `Mi-temps : ${homeName} ${h} - ${a} ${awayName}` });
-    }
-    feed.push({ minute: 90, text: `Coup de sifflet final : ${homeName} ${hg} - ${ag} ${awayName}` });
-    return feed;
-  }
-
-  function rndMinute() { return Math.floor(Math.random() * 90) + 1; }
-
-  function randomScorer(gs, clubId) {
-    // Un buteur plausible : plutôt un attaquant/milieu, sinon n'importe.
-    const squad = gs.players.filter(p => p.clubId === clubId);
-    const attackers = squad.filter(p => p.poste === "A" || p.poste === "M");
-    const pool = attackers.length ? attackers : squad;
-    if (!pool.length) return "un joueur";
-    return pool[Math.floor(Math.random() * pool.length)].name;
-  }
-
-  function clubName(gs, clubId) {
-    const c = gs.clubs.find(c => c.id === clubId);
-    return c ? c.name : "?";
-  }
-
-  return { resolvePlayerMatch };
+  return {
+    catalogue, activeObjectiveKeys, setObjectives,
+    currentValue, isMet, evaluate, resetForNewSeason,
+  };
 })();
 
-window.MatchManager = MatchManager;
+window.BoardManager = BoardManager;

@@ -1,176 +1,138 @@
 /* ============================================================
-   managers/season.js — Orchestration des saisons (Phase 1)
+   gamestate.js — L'état central du jeu (GameState)
    ------------------------------------------------------------
-   Met en place une saison : championnat + calendrier des journées.
-   Gère aussi l'ENCHAÎNEMENT vers la saison suivante (nextSeason).
+   Un unique objet contient TOUTES les données du jeu.
+   C'est le "contrat" que tous les Managers respectent :
+   chaque Manager lit et écrit ici, et rien d'autre.
+   C'est aussi cet objet, et lui seul, qui est sauvegardé.
+   Réf : Chapitre 13 — Architecture technique.
    ============================================================ */
 
-const SeasonManager = (function () {
+const GameState = {
 
-  /* Démarre la PREMIÈRE saison : crée la ligue (club du joueur ajouté),
-     puis entre en PRÉ-SAISON (intersaison avec stage) avant la saison 1.
-     Uniformise le déroulé : toute saison commence par une pré-saison. */
-  function startSeason(gs, clubList, playerClubInfo) {
-    WorldManager.setupLeague(gs, clubList, playerClubInfo);
-    // On entre en pré-saison au lieu de programmer les matchs tout de suite.
-    // La saison 1 sera programmée à la fin de la pré-saison (goToPreseason).
-    gs.world.firstSeasonPending = true;
-    startIntersaison(gs);
-  }
+  /* --- Métadonnées de la partie --- */
+  meta: {
+    version: 1,            // version du schéma (pour migrations futures)
+    createdAt: null,       // date de création de la partie (timestamp)
+    lastSaved: null,       // date de dernière sauvegarde (timestamp)
+    seed: null,            // graine aléatoire (pour reproductibilité)
+  },
 
-  /* Programme la saison 1 après la pré-saison initiale (sans incrémenter
-     le numéro de saison ni vieillir les joueurs — c'est la 1re saison). */
-  function beginFirstSeason(gs) {
-    // Appliquer le bonus de forme du stage de pré-saison, s'il y en a un.
-    let bonus = gs.world.pendingFormBonus || 0;
-    if (window.StaffManager) bonus += StaffManager.formBonus(gs);
-    if (bonus > 0) {
-      for (const p of gs.players) {
-        if (p.clubId === gs.club.id) {
-          p.forme = Math.min(100, (p.forme || 50) + bonus);
-        }
-      }
-    }
-    gs.world.pendingFormBonus = 0;
-    gs.world.firstSeasonPending = false;
-    gs.time.phase = "season";
-    gs.world.tvPaidSeason = false;
-    if (window.FinanceManager) FinanceManager.resetSeasonCounters(gs);
-    if (window.BoardManager) BoardManager.resetForNewSeason(gs);
-    scheduleSeason(gs);
-  }
+  /* --- Le temps --- */
+  time: {
+    currentDate: null,     // date courante dans le jeu (AAAA-MM-JJ)
+    season: 1,             // numéro de saison en cours
+    inMercato: false,      // sommes-nous dans une fenêtre de mercato ?
+    phase: "season",       // "season" | "intersaison"
+  },
 
-  /* Démarre la saison SUIVANTE : on garde les clubs et les joueurs,
-     on vieillit les joueurs d'un an, on remet le classement à zéro
-     et on reprogramme un nouveau calendrier. */
-  function nextSeason(gs) {
-    gs.time.season += 1;
+  /* --- Le Président (le joueur) --- */
+  president: {
+    name: "",
+    reputation: "amateur", // "amateur" | "confirme" | "legende"
+    personalWealth: 0,     // fortune personnelle (M), distincte du club
+  },
 
-    // Vieillir tous les joueurs d'un an (léger, Phase 1).
-    for (const p of gs.players) {
-      p.age += 1;
-      // Statistiques par saison : on repart de zéro.
-      p.stats = { apps: 0, goals: 0, assists: 0, cards: 0, cleansheets: 0 };
-    }
+  /* --- Le club du joueur --- */
+  club: {
+    id: null,
+    name: "",
+    country: null,         // pays choisi parmi les 5 grands
+    division: 2,           // on démarre en 2e division
+    cash: 0,               // trésorerie du club (M)
+    reputation: 0,         // réputation du club (0-100)
+    stadiumCapacity: 0,
+    academyLevel: 1,       // niveau du centre de formation
+    medicalLevel: 1,       // niveau du centre médical
+  },
 
-    // Appliquer le bonus de forme du stage de préparation (s'il y en a un)
-    // aux joueurs du club du joueur, pour bien démarrer la saison.
-    let bonus = gs.world.pendingFormBonus || 0;
-    if (window.StaffManager) bonus += StaffManager.formBonus(gs);
-    if (bonus > 0) {
-      for (const p of gs.players) {
-        if (p.clubId === gs.club.id) {
-          p.forme = Math.min(100, (p.forme || 50) + bonus);
-        }
-      }
-    }
-    gs.world.pendingFormBonus = 0;
+  /* --- Le Board --- */
+  board: {
+    confidence: 70,        // confiance sur 100 (départ : 70)
+    objectives: [],        // 3 objectifs de la saison en cours
+  },
 
-    // Remettre les compteurs du classement à zéro.
-    gs.world.standings = {};
-    for (const c of gs.clubs) {
-      gs.world.standings[c.id] = {
-        clubId: c.id, played: 0, won: 0, drawn: 0, lost: 0,
-        gf: 0, ga: 0, points: 0,
-      };
-    }
+  /* --- Le climat interne (jauges) --- */
+  climate: {
+    coachTrust: 70,        // confiance du coach (0-100)
+    dressingRoom: 70,      // ambiance du vestiaire (0-100)
+  },
 
-    // Nouveau calendrier de la saison.
-    gs.world.fixtures = WorldManager.buildFixtures(gs.clubs.map(c => c.id));
-    gs.world.currentMatchday = 0;
+  /* --- Les entités du monde --- */
+  players: [],             // tous les joueurs (tous clubs confondus)
+  clubs: [],               // tous les clubs (IA + joueur)
+  staff: [],               // coach, scouts, médical
 
-    gs.time.phase = "season";
-    gs.world.tvPaidSeason = false;
-    if (window.FinanceManager) FinanceManager.resetSeasonCounters(gs);
-    if (window.BoardManager) BoardManager.resetForNewSeason(gs);
-    scheduleSeason(gs);
-  }
+  /* --- Le monde / compétitions --- */
+  world: {
+    competitions: [],      // championnats, coupes, europe
+    standings: {},         // classements par compétition
+  },
 
-  /* Entre en INTERSAISON (après le bilan de fin de saison).
-     Période creuse, fin mai -> mi-août, où le joueur avance semaine
-     par semaine (ou saute à la pré-saison). Sème 2-3 messages simples
-     de préparation. Ne recrée PAS encore la saison : ça se fait à la
-     pré-saison via nextSeason(). */
-  function startIntersaison(gs) {
-    gs.time.phase = "intersaison";
-    // La date courante est ~ la fin de saison (mai). On fixe la
-    // reprise à la mi-août (pré-saison) de la même année civile.
-    const year = Number(gs.time.currentDate.split("-")[0]);
-    gs.time.preseasonDate = `${year}-08-15`;
+  /* --- La file d'événements (moteur du temps) --- */
+  events: [],              // événements datés, triés par date
 
-    // Événements de préparation, répartis sur l'intersaison.
-    // Le stage est une DÉCISION (écran de choix) ; les autres sont
-    // de simples messages informatifs.
-    const msgs = [
-      { offsetDays: 7,  text: "Ouverture du mercato d'été", type: "mercato_open" },
-      { offsetDays: 14, text: "Reprise de l'entraînement", type: "intersaison_msg" },
-      { offsetDays: 35, text: "Stage de préparation", type: "training_camp" },
-      { offsetDays: 56, text: "Matchs amicaux de pré-saison", type: "intersaison_msg" },
-    ];
-    for (const m of msgs) {
-      const d = CalendarManager.addDays(gs.time.currentDate, m.offsetDays);
-      // Ne pas dépasser la date de pré-saison.
-      if (CalendarManager.compare(d, gs.time.preseasonDate) < 0) {
-        CalendarManager.addEvent(gs, {
-          date: d, type: m.type, label: m.text,
-        });
-      }
-    }
-  }
+  /* --- Historique (Hall of Fame, palmarès...) --- */
+  history: {
+    hallOfFame: [],
+    seasons: [],
+  },
+};
 
-  /* Programme les événements d'une saison à partir de la date
-     courante : une journée par semaine dès le ~20 août, puis un
-     événement de fin de saison. Commun à startSeason/nextSeason. */
-  function scheduleSeason(gs) {
-    let date = firstMatchdayDate(gs.time.currentDate);
-    const nbDays = gs.world.fixtures.length;
+/* ------------------------------------------------------------
+   Fabrique d'une nouvelle partie vierge.
+   Retourne un GameState frais (copie profonde du modèle),
+   initialisé avec les quelques valeurs de départ nécessaires.
+   ------------------------------------------------------------ */
+function createNewGame(options = {}) {
+  // Copie profonde du modèle pour ne jamais muter l'original.
+  const gs = structuredClone(GameState);
 
-    // Table permanente des dates de journées (survit au retrait des
-    // événements une fois les journées jouées) — utilisée par le calendrier.
-    gs.world.matchdayDates = {};
+  const now = Date.now();
+  gs.meta.createdAt = now;
+  gs.meta.lastSaved = now;
+  gs.meta.seed = options.seed ?? now;
 
-    for (let md = 0; md < nbDays; md++) {
-      gs.world.matchdayDates[md] = date;
-      CalendarManager.addEvent(gs, {
-        date: date,
-        type: "matchday",
-        matchday: md,
-        label: `Journée ${md + 1}`,
-      });
-      date = CalendarManager.addDays(date, 7);
-    }
+  // Le temps démarre à une date de pré-saison (1er juillet).
+  // L'année est arbitraire ; seule la mécanique compte.
+  gs.time.currentDate = options.startDate ?? "2025-07-01";
+  gs.time.season = 1;
+  gs.time.inMercato = false;
+  gs.time.phase = "season";
 
-    CalendarManager.addEvent(gs, {
-      date: date,
-      type: "season_end",
-      label: "Fin de saison",
-    });
-    gs.world.seasonEndDate = date;
+  // Le Président.
+  gs.president.name = options.presidentName ?? "Président";
+  gs.president.reputation = options.reputation ?? "amateur";
+  gs.president.personalWealth = 0;
 
-    // Événements de mercato (le mercato d'ÉTÉ est ouvert dès la pré-saison,
-    // voir startIntersaison ; ici on programme sa fermeture + l'hiver).
-    const y = Number(firstMatchdayDate(gs.time.currentDate).split("-")[0]);
-    CalendarManager.addEvent(gs, { date: `${y}-09-01`, type: "mercato_close", label: "Fermeture du mercato d'été" });
-    CalendarManager.addEvent(gs, { date: `${y + 1}-01-01`, type: "mercato_open", label: "Ouverture du mercato d'hiver" });
-    CalendarManager.addEvent(gs, { date: `${y + 1}-02-01`, type: "mercato_close", label: "Fermeture du mercato d'hiver" });
-  }
+  // Le club (valeurs d'équilibrage de départ, ch. 17).
+  gs.club.name = options.clubName ?? "Club Sans Nom";
+  gs.club.country = options.country ?? null;
+  gs.club.division = 2;
+  gs.club.cash = 15;          // 15 M de trésorerie de départ en D2
+  gs.club.reputation = 20;
+  gs.club.academyLevel = 1;
+  gs.club.medicalLevel = 1;
 
-  /* Première journée : ~20 août de l'année qui SUIT la date courante
-     si on est déjà en fin de saison (mai), sinon l'année courante. */
-  function firstMatchdayDate(currentDate) {
-    const [y, m] = currentDate.split("-").map(Number);
-    // Si on est après juin, la saison démarre l'année suivante.
-    const year = (m >= 6) ? y : y; // Phase 1 : garder simple, même année civile
-    // Pour l'enchaînement, on part toujours du prochain 20 août
-    // situé après la date courante.
-    let target = `${y}-08-20`;
-    if (CalendarManager.compare(target, currentDate) <= 0) {
-      target = `${y + 1}-08-20`;
-    }
-    return target;
-  }
+  // Le Board démarre à 70 de confiance.
+  gs.board.confidence = 70;
+  gs.board.objectives = [];
 
-  return { startSeason, beginFirstSeason, nextSeason, startIntersaison, scheduleSeason, firstMatchdayDate };
-})();
+  // État financier (journal des opérations, compteurs de saison).
+  gs.finance = { ledger: [], seasonIncome: 0, seasonExpense: 0 };
+  gs.world.tvPaidSeason = false;
 
-window.SeasonManager = SeasonManager;
+  // État des transferts (offres du mercato en cours).
+  gs.transfers = { offers: [], loans: [], active: [], window: false };
+
+  // Staff : chaque poste est une liste de titulaires, vide au départ
+  // (poste vacant tenu par un intérimaire). Jusqu'à 3 recruteurs et
+  // 3 médecins ; un seul entraîneur.
+  gs.staff = { coach: [], scout: [], medic: [] };
+
+  return gs;
+}
+
+/* Rendre accessible globalement (chargement par <script>, sans modules). */
+window.GameState = GameState;
+window.createNewGame = createNewGame;
