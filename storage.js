@@ -1,176 +1,157 @@
 /* ============================================================
-   managers/season.js — Orchestration des saisons (Phase 1)
+   storage.js — Sauvegarde persistante par SLOTS (IndexedDB)
    ------------------------------------------------------------
-   Met en place une saison : championnat + calendrier des journées.
-   Gère aussi l'ENCHAÎNEMENT vers la saison suivante (nextSeason).
+   Plusieurs parties en parallèle, chacune dans son slot.
+   3 slots au départ, extensible (voir SLOT_COUNT).
+   Réf : Chapitre 13 — Architecture technique.
+
+   API publique :
+     Storage.init()              -> prépare la base (Promise)
+     Storage.SLOT_COUNT          -> nombre de slots
+     Storage.saveSlot(n, gs)     -> sauvegarde la partie dans le slot n
+     Storage.loadSlot(n)         -> charge le slot n, ou null
+     Storage.deleteSlot(n)       -> vide le slot n
+     Storage.listSlots()         -> [{slot, empty, summary}] pour l'accueil
    ============================================================ */
 
-const SeasonManager = (function () {
+const Storage = (function () {
 
-  /* Démarre la PREMIÈRE saison : crée la ligue (club du joueur ajouté),
-     puis entre en PRÉ-SAISON (intersaison avec stage) avant la saison 1.
-     Uniformise le déroulé : toute saison commence par une pré-saison. */
-  function startSeason(gs, clubList, playerClubInfo) {
-    WorldManager.setupLeague(gs, clubList, playerClubInfo);
-    // On entre en pré-saison au lieu de programmer les matchs tout de suite.
-    // La saison 1 sera programmée à la fin de la pré-saison (goToPreseason).
-    gs.world.firstSeasonPending = true;
-    startIntersaison(gs);
-  }
+  const DB_NAME = "president_de_club";
+  const DB_VERSION = 2;               // bump : passage aux slots
+  const STORE = "slots";
+  const SLOT_COUNT = 3;               // nombre de slots (extensible)
 
-  /* Programme la saison 1 après la pré-saison initiale (sans incrémenter
-     le numéro de saison ni vieillir les joueurs — c'est la 1re saison). */
-  function beginFirstSeason(gs) {
-    // Appliquer le bonus de forme du stage de pré-saison, s'il y en a un.
-    let bonus = gs.world.pendingFormBonus || 0;
-    if (window.StaffManager) bonus += StaffManager.formBonus(gs);
-    if (bonus > 0) {
-      for (const p of gs.players) {
-        if (p.clubId === gs.club.id) {
-          p.forme = Math.min(100, (p.forme || 50) + bonus);
+  let _db = null;
+
+  function init() {
+    return new Promise((resolve, reject) => {
+      if (_db) return resolve(_db);
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        // Créer le store des slots s'il n'existe pas.
+        if (!db.objectStoreNames.contains(STORE)) {
+          db.createObjectStore(STORE);
         }
-      }
-    }
-    gs.world.pendingFormBonus = 0;
-    gs.world.firstSeasonPending = false;
-    gs.time.phase = "season";
-    gs.world.tvPaidSeason = false;
-    if (window.FinanceManager) FinanceManager.resetSeasonCounters(gs);
-    if (window.BoardManager) BoardManager.resetForNewSeason(gs);
-    scheduleSeason(gs);
-  }
-
-  /* Démarre la saison SUIVANTE : on garde les clubs et les joueurs,
-     on vieillit les joueurs d'un an, on remet le classement à zéro
-     et on reprogramme un nouveau calendrier. */
-  function nextSeason(gs) {
-    gs.time.season += 1;
-
-    // Vieillir tous les joueurs d'un an (léger, Phase 1).
-    for (const p of gs.players) {
-      p.age += 1;
-      // Statistiques par saison : on repart de zéro.
-      p.stats = { apps: 0, goals: 0, assists: 0, cards: 0, cleansheets: 0 };
-    }
-
-    // Appliquer le bonus de forme du stage de préparation (s'il y en a un)
-    // aux joueurs du club du joueur, pour bien démarrer la saison.
-    let bonus = gs.world.pendingFormBonus || 0;
-    if (window.StaffManager) bonus += StaffManager.formBonus(gs);
-    if (bonus > 0) {
-      for (const p of gs.players) {
-        if (p.clubId === gs.club.id) {
-          p.forme = Math.min(100, (p.forme || 50) + bonus);
+        // Nettoyer l'ancien store "saves" (Phase 0/1 mono-partie).
+        if (db.objectStoreNames.contains("saves")) {
+          db.deleteObjectStore("saves");
         }
-      }
-    }
-    gs.world.pendingFormBonus = 0;
-
-    // Remettre les compteurs du classement à zéro.
-    gs.world.standings = {};
-    for (const c of gs.clubs) {
-      gs.world.standings[c.id] = {
-        clubId: c.id, played: 0, won: 0, drawn: 0, lost: 0,
-        gf: 0, ga: 0, points: 0,
       };
-    }
-
-    // Nouveau calendrier de la saison.
-    gs.world.fixtures = WorldManager.buildFixtures(gs.clubs.map(c => c.id));
-    gs.world.currentMatchday = 0;
-
-    gs.time.phase = "season";
-    gs.world.tvPaidSeason = false;
-    if (window.FinanceManager) FinanceManager.resetSeasonCounters(gs);
-    if (window.BoardManager) BoardManager.resetForNewSeason(gs);
-    scheduleSeason(gs);
-  }
-
-  /* Entre en INTERSAISON (après le bilan de fin de saison).
-     Période creuse, fin mai -> mi-août, où le joueur avance semaine
-     par semaine (ou saute à la pré-saison). Sème 2-3 messages simples
-     de préparation. Ne recrée PAS encore la saison : ça se fait à la
-     pré-saison via nextSeason(). */
-  function startIntersaison(gs) {
-    gs.time.phase = "intersaison";
-    // La date courante est ~ la fin de saison (mai). On fixe la
-    // reprise à la mi-août (pré-saison) de la même année civile.
-    const year = Number(gs.time.currentDate.split("-")[0]);
-    gs.time.preseasonDate = `${year}-08-15`;
-
-    // Événements de préparation, répartis sur l'intersaison.
-    // Le stage est une DÉCISION (écran de choix) ; les autres sont
-    // de simples messages informatifs.
-    const msgs = [
-      { offsetDays: 7,  text: "Ouverture du mercato d'été", type: "mercato_open" },
-      { offsetDays: 14, text: "Reprise de l'entraînement", type: "intersaison_msg" },
-      { offsetDays: 35, text: "Stage de préparation", type: "training_camp" },
-      { offsetDays: 56, text: "Matchs amicaux de pré-saison", type: "intersaison_msg" },
-    ];
-    for (const m of msgs) {
-      const d = CalendarManager.addDays(gs.time.currentDate, m.offsetDays);
-      // Ne pas dépasser la date de pré-saison.
-      if (CalendarManager.compare(d, gs.time.preseasonDate) < 0) {
-        CalendarManager.addEvent(gs, {
-          date: d, type: m.type, label: m.text,
-        });
-      }
-    }
-  }
-
-  /* Programme les événements d'une saison à partir de la date
-     courante : une journée par semaine dès le ~20 août, puis un
-     événement de fin de saison. Commun à startSeason/nextSeason. */
-  function scheduleSeason(gs) {
-    let date = firstMatchdayDate(gs.time.currentDate);
-    const nbDays = gs.world.fixtures.length;
-
-    // Table permanente des dates de journées (survit au retrait des
-    // événements une fois les journées jouées) — utilisée par le calendrier.
-    gs.world.matchdayDates = {};
-
-    for (let md = 0; md < nbDays; md++) {
-      gs.world.matchdayDates[md] = date;
-      CalendarManager.addEvent(gs, {
-        date: date,
-        type: "matchday",
-        matchday: md,
-        label: `Journée ${md + 1}`,
-      });
-      date = CalendarManager.addDays(date, 7);
-    }
-
-    CalendarManager.addEvent(gs, {
-      date: date,
-      type: "season_end",
-      label: "Fin de saison",
+      req.onsuccess = (e) => { _db = e.target.result; resolve(_db); };
+      req.onerror = (e) => reject(new Error("IndexedDB indisponible : " + e.target.error));
     });
-    gs.world.seasonEndDate = date;
-
-    // Événements de mercato (le mercato d'ÉTÉ est ouvert dès la pré-saison,
-    // voir startIntersaison ; ici on programme sa fermeture + l'hiver).
-    const y = Number(firstMatchdayDate(gs.time.currentDate).split("-")[0]);
-    CalendarManager.addEvent(gs, { date: `${y}-09-01`, type: "mercato_close", label: "Fermeture du mercato d'été" });
-    CalendarManager.addEvent(gs, { date: `${y + 1}-01-01`, type: "mercato_open", label: "Ouverture du mercato d'hiver" });
-    CalendarManager.addEvent(gs, { date: `${y + 1}-02-01`, type: "mercato_close", label: "Fermeture du mercato d'hiver" });
   }
 
-  /* Première journée : ~20 août de l'année qui SUIT la date courante
-     si on est déjà en fin de saison (mai), sinon l'année courante. */
-  function firstMatchdayDate(currentDate) {
-    const [y, m] = currentDate.split("-").map(Number);
-    // Si on est après juin, la saison démarre l'année suivante.
-    const year = (m >= 6) ? y : y; // Phase 1 : garder simple, même année civile
-    // Pour l'enchaînement, on part toujours du prochain 20 août
-    // situé après la date courante.
-    let target = `${y}-08-20`;
-    if (CalendarManager.compare(target, currentDate) <= 0) {
-      target = `${y + 1}-08-20`;
+  function _key(slot) { return "slot_" + slot; }
+
+  function _get(key) {
+    return new Promise((resolve, reject) => {
+      const tx = _db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function _put(key, value) {
+    return new Promise((resolve, reject) => {
+      const tx = _db.transaction(STORE, "readwrite");
+      const req = tx.objectStore(STORE).put(value, key);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function _del(key) {
+    return new Promise((resolve, reject) => {
+      const tx = _db.transaction(STORE, "readwrite");
+      const req = tx.objectStore(STORE).delete(key);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  /* Sauvegarde le GameState dans le slot n. */
+  async function saveSlot(slot, gs) {
+    await init();
+    gs.meta.lastSaved = Date.now();
+    gs.meta.slot = slot;
+    const snapshot = structuredClone(gs);
+    await _put(_key(slot), snapshot);
+    return true;
+  }
+
+  /* Charge la partie du slot n (ou null si vide). */
+  async function loadSlot(slot) {
+    await init();
+    return await _get(_key(slot));
+  }
+
+  /* Vide le slot n (le vrai "recommencer"). */
+  async function deleteSlot(slot) {
+    await init();
+    await _del(_key(slot));
+    return true;
+  }
+
+  /* --- Profil joueur GLOBAL (XP), séparé des slots ---
+     Persiste même si on supprime une partie. Compte le nombre
+     total de saisons jouées, toutes parties confondues. */
+  const PROFILE_KEY = "profile";
+
+  async function getProfile() {
+    await init();
+    const p = await _get(PROFILE_KEY);
+    return p || { totalSeasons: 0 };
+  }
+
+  async function saveProfile(profile) {
+    await init();
+    await _put(PROFILE_KEY, structuredClone(profile));
+    return true;
+  }
+
+  /* Ajoute une saison jouée au compteur global et renvoie le total. */
+  async function addSeasonPlayed() {
+    const p = await getProfile();
+    p.totalSeasons = (p.totalSeasons || 0) + 1;
+    await saveProfile(p);
+    return p.totalSeasons;
+  }
+
+  /* Résumé léger d'une partie, pour l'affichage sur l'accueil. */
+  function summarize(gs) {
+    if (!gs) return null;
+    return {
+      clubName: gs.club && gs.club.name ? gs.club.name : "—",
+      country: gs.club && gs.club.country ? gs.club.country : "—",
+      season: gs.time ? gs.time.season : 1,
+      date: gs.time ? gs.time.currentDate : null,
+      lastSaved: gs.meta ? gs.meta.lastSaved : null,
+    };
+  }
+
+  /* Liste l'état des slots pour l'écran d'accueil. */
+  async function listSlots() {
+    await init();
+    const out = [];
+    for (let s = 1; s <= SLOT_COUNT; s++) {
+      const gs = await _get(_key(s));
+      out.push({
+        slot: s,
+        empty: gs === null,
+        summary: gs ? summarize(gs) : null,
+      });
     }
-    return target;
+    return out;
   }
 
-  return { startSeason, beginFirstSeason, nextSeason, startIntersaison, scheduleSeason, firstMatchdayDate };
+  return {
+    init, SLOT_COUNT,
+    saveSlot, loadSlot, deleteSlot, listSlots, summarize,
+    getProfile, saveProfile, addSeasonPlayed,
+  };
 })();
 
-window.SeasonManager = SeasonManager;
+window.Storage = Storage;
